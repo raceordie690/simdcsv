@@ -44,6 +44,7 @@ import (
 // including in multiline field values, so that the returned data does
 // not depend on which line-ending convention an input file uses.
 type Reader struct {
+	sync.Mutex
 	// Comma is the field delimiter.
 	// It is set to comma (',') by NewReader.
 	// Comma must be a valid rune and must not be \r, \n,
@@ -78,7 +79,16 @@ type Reader struct {
 	ReuseRecord   bool // Deprecated: Unused by simdcsv.
 	TrailingComma bool // Deprecated: No longer used.
 
-	r *bufio.Reader
+	r    *bufio.Reader
+	rCsv *csv.Reader // Used as fallback when simd isn't supported
+
+	//* state: IsStreaming when true, the readallstreaming process is active
+	IsStreaming bool
+	records     [][]string            //Current block of records
+	hash        map[int]recordsOutput // seqences of blocks waiting
+	currrecord  int                   //current record in block
+	sequence    int                   // current block sequence number
+	readchan    chan recordsOutput
 }
 
 var errInvalidDelim = errors.New("csv: invalid field or comment delimiter")
@@ -119,7 +129,11 @@ type chunkIn struct {
 // readAllStreaming reads all the remaining records from r.
 func (r *Reader) readAllStreaming() (out chan recordsOutput) {
 
-	out = make(chan recordsOutput, 20)
+	if r.IsStreaming {
+		return nil // We don't want 2 active readers
+	}
+	r.IsStreaming = true
+	out = make(chan recordsOutput, 128)
 
 	fallback := func(ioReader io.Reader) recordsOutput {
 		rCsv := csv.NewReader(ioReader)
@@ -138,6 +152,7 @@ func (r *Reader) readAllStreaming() (out chan recordsOutput) {
 			out <- recordsOutput{-1, nil, errInvalidDelim}
 			close(out)
 		}()
+		r.IsStreaming = false
 		return
 	}
 
@@ -148,6 +163,7 @@ func (r *Reader) readAllStreaming() (out chan recordsOutput) {
 			out <- fallback(r.r)
 			close(out)
 		}()
+		r.IsStreaming = false
 		return
 	}
 
@@ -162,7 +178,10 @@ func (r *Reader) readAllStreaming() (out chan recordsOutput) {
 
 	go func() {
 
-		defer close(bufchan)
+		defer func() {
+			close(bufchan)
+			r.IsStreaming = false
+		}()
 
 		br := bufio.NewReader(r.r)
 		chunk := make([]byte, chunkSize)
@@ -207,7 +226,7 @@ func (r *Reader) readAllStreaming() (out chan recordsOutput) {
 		var wg sync.WaitGroup
 
 		// Determine how many second stages to run in parallel
-		const cores = 3
+		const cores = 2
 		wg.Add(cores)
 		fieldsPerRecord := int64(r.FieldsPerRecord)
 
@@ -387,16 +406,23 @@ func (r *Reader) stage2Streaming(chunks chan chunkInfo, wg *sync.WaitGroup, fiel
 // defined to read until EOF, it does not treat end of file as an error to be
 // reported.
 func (r *Reader) ReadAll() ([][]string, error) {
-
+	r.Lock()
+	defer r.Unlock()
 	if !SupportedCPU() {
-		rCsv := csv.NewReader(r.r)
-		rCsv.LazyQuotes = r.LazyQuotes
-		rCsv.TrimLeadingSpace = r.TrimLeadingSpace
-		rCsv.Comment = r.Comment
-		rCsv.Comma = r.Comma
-		rCsv.FieldsPerRecord = r.FieldsPerRecord
-		rCsv.ReuseRecord = r.ReuseRecord
-		return rCsv.ReadAll()
+		if r.rCsv == nil {
+			r.rCsv = csv.NewReader(r.r)
+			defer func() {
+				r.rCsv = nil
+			}()
+			r.rCsv.LazyQuotes = r.LazyQuotes
+			r.rCsv.TrimLeadingSpace = r.TrimLeadingSpace
+			r.rCsv.Comment = r.Comment
+			r.rCsv.Comma = r.Comma
+			r.rCsv.FieldsPerRecord = r.FieldsPerRecord
+			r.rCsv.ReuseRecord = r.ReuseRecord
+		}
+
+		return r.rCsv.ReadAll()
 	}
 
 	out := r.readAllStreaming()
@@ -440,6 +466,91 @@ func (r *Reader) ReadAll() ([][]string, error) {
 	} else {
 		return records, nil
 	}
+}
+
+func (r *Reader) Read() ([]string, error) {
+	r.Lock()
+	defer r.Unlock()
+	if !SupportedCPU() {
+		if r.rCsv == nil {
+			r.rCsv = csv.NewReader(r.r)
+			r.rCsv.LazyQuotes = r.LazyQuotes
+			r.rCsv.TrimLeadingSpace = r.TrimLeadingSpace
+			r.rCsv.Comment = r.Comment
+			r.rCsv.Comma = r.Comma
+			r.rCsv.FieldsPerRecord = r.FieldsPerRecord
+			r.rCsv.ReuseRecord = r.ReuseRecord
+		}
+
+		return r.rCsv.Read()
+	}
+
+	if !r.IsStreaming {
+		r.records = make([][]string, 0)
+		r.hash = make(map[int]recordsOutput)
+		r.currrecord = 0
+		r.sequence = 0
+		r.readchan = r.readAllStreaming()
+	}
+
+	if r.currrecord >= len(r.records) {
+		err := r.nextblock()
+		if err != nil {
+			return nil, err
+		}
+	}
+	ret := r.records[r.currrecord]
+	r.currrecord++
+	return ret, nil
+
+}
+
+func (r *Reader) clearchan() {
+	for _ = range r.readchan {
+		//...
+	}
+}
+
+func (r *Reader) nextblock() error {
+
+	for {
+		rcrds, ok := r.hash[r.sequence]
+		if ok {
+			r.sequence++
+			if len(rcrds.records) == 0 {
+				continue
+			}
+			if rcrds.err != nil {
+				r.clearchan()
+				return rcrds.err
+			}
+			r.currrecord = 0
+			r.records = rcrds.records
+			return nil
+		}
+		break
+	}
+	for rcrds := range r.readchan {
+		if rcrds.sequence > r.sequence {
+			r.hash[rcrds.sequence] = rcrds
+			continue
+		}
+		if rcrds.sequence == r.sequence {
+			delete(r.hash, rcrds.sequence)
+			r.sequence++
+			if rcrds.err != nil {
+				r.clearchan()
+				return rcrds.err
+			}
+			if len(rcrds.records) == 0 {
+				continue
+			}
+			r.records = rcrds.records
+			r.currrecord = 0
+			return nil
+		}
+	}
+	return io.EOF
 }
 
 func filterOutComments(records *[][]string, comment byte) {

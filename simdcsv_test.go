@@ -21,6 +21,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/bits"
@@ -31,11 +32,9 @@ import (
 	"unicode/utf8"
 )
 
-//
 // Below are the test cases from `encoding/csv`.
 //
 // They are copied directly from https://golang.org/src/encoding/csv/reader_test.go
-//
 func TestRead(t *testing.T) {
 	tests := []struct {
 		Name   string
@@ -892,6 +891,43 @@ func benchmarkEncodingCsv(b *testing.B, file string) {
 		_, err := r.ReadAll()
 		if err != nil {
 			log.Fatalf("%v", err)
+		}
+	}
+}
+
+func BenchmarkSimdReadCsv(b *testing.B) {
+	b.Run("parking-citations-100K", func(b *testing.B) {
+		benchmarkSimdReadCsv(b, "testdata/parking-citations-100K.csv")
+	})
+	b.Run("worldcitiespop-100K", func(b *testing.B) {
+		benchmarkSimdReadCsv(b, "testdata/worldcitiespop-100K.csv")
+	})
+	b.Run("nyc-taxi-data-100K", func(b *testing.B) {
+		benchmarkSimdReadCsv(b, "testdata/nyc-taxi-data-100K.csv")
+	})
+}
+
+func benchmarkSimdReadCsv(b *testing.B, file string) {
+
+	buf, err := ioutil.ReadFile(file)
+	if err != nil {
+		panic(err)
+	}
+
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		r := NewReader(bytes.NewReader(buf))
+		_, err := r.Read()
+		for err == nil {
+			_, err = r.Read()
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Fatalf("%v", err)
+			}
 		}
 	}
 }
